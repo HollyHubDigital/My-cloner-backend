@@ -459,8 +459,17 @@ async function renderWithBrowserless(url) {
     return response.data;
   } catch (error) {
     console.error(`⚠️ Browserless FAILED: ${error.message}`);
-    if (error.response?.status) console.error(`   HTTP ${error.response.status}`);
-    if (error.response?.data) console.error(`   Response: ${String(error.response.data).substring(0, 200)}`);
+    if (error.response?.status) {
+      console.error(`   HTTP ${error.response.status}`);
+      const respData = error.response?.data;
+      if (typeof respData === 'string') {
+        console.error(`   Response: ${respData.substring(0, 500)}`);
+      } else if (respData) {
+        console.error(`   Response:`, JSON.stringify(respData).substring(0, 500));
+      }
+    } else {
+      console.error(`   Error details:`, error.code, error.errno);
+    }
     return null;
   }
 }
@@ -496,7 +505,14 @@ async function renderWithScrapingBee(url) {
     console.error(`⚠️ ScrapingBee FAILED: ${error.message}`);
     if (error.response?.status) {
       console.error(`   HTTP ${error.response.status}`);
-      console.error(`   Response:`, error.response?.data?.substring(0, 200));
+      const respData = error.response?.data;
+      if (typeof respData === 'string') {
+        console.error(`   Response: ${respData.substring(0, 500)}`);
+      } else if (respData) {
+        console.error(`   Response:`, JSON.stringify(respData).substring(0, 500));
+      }
+    } else {
+      console.error(`   Error details:`, error.code, error.errno);
     }
     return null;
   }
