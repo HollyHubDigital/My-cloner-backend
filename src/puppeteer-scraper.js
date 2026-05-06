@@ -465,9 +465,11 @@ async function renderWithScrapingBee(url) {
   try {
     console.log(`☁️ Trying ScrapingBee...`);
     
+    const apiKey = process.env.SCRAPINGBEE_API_KEY || 'public';
+    
     const params = new URLSearchParams({
       url: url,
-      api_key: 'public',
+      api_key: apiKey,
       render_javascript: 'true',
     });
 
@@ -528,11 +530,14 @@ export async function scrapeWithPuppeteer(url) {
     }
 
     if (!html) {
+      const browserlessKey = process.env.BROWSERLESS_API_KEY || 'demo';
+      const scrapingbeeKey = process.env.SCRAPINGBEE_API_KEY || 'public';
+      
       const errorDetails = `
         ❌ ALL RENDERING METHODS FAILED
         Strategy 1 (Local Puppeteer): ${puppeteerModule ? 'Available but failed' : 'Not available'}
-        Strategy 2 (Browserless): Using key '${process.env.BROWSERLESS_API_KEY || 'demo'}'
-        Strategy 3 (ScrapingBee): Using key 'public'
+        Strategy 2 (Browserless): Using key '${browserlessKey}'
+        Strategy 3 (ScrapingBee): Using key '${scrapingbeeKey}'
         
         SOLUTION: Add API keys to Vercel environment variables:
         - BROWSERLESS_API_KEY (get free at browserless.io)
