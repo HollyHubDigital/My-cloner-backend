@@ -434,6 +434,8 @@ async function renderWithBrowserless(url) {
     console.log(`☁️ Trying Browserless cloud browser...`);
     
     const apiKey = process.env.BROWSERLESS_API_KEY || 'demo';
+    const keyDisplay = apiKey === 'demo' ? 'demo (limited)' : apiKey.substring(0, 10) + '...';
+    console.log(`   Using key: ${keyDisplay}`);
     
     const payload = {
       url: url,
@@ -442,6 +444,8 @@ async function renderWithBrowserless(url) {
       scrollPage: false,
     };
 
+    console.log(`   Sending request...`);
+    
     const response = await axios.post(
       `https://chrome.browserless.io/content?token=${apiKey}`,
       payload,
@@ -456,6 +460,7 @@ async function renderWithBrowserless(url) {
   } catch (error) {
     console.error(`⚠️ Browserless FAILED: ${error.message}`);
     if (error.response?.status) console.error(`   HTTP ${error.response.status}`);
+    if (error.response?.data) console.error(`   Response: ${String(error.response.data).substring(0, 200)}`);
     return null;
   }
 }
@@ -466,6 +471,7 @@ async function renderWithScrapingBee(url) {
     console.log(`☁️ Trying ScrapingBee...`);
     
     const apiKey = process.env.SCRAPINGBEE_API_KEY || 'public';
+    console.log(`   Using key: ${apiKey.substring(0, 10)}...`);
     
     const params = new URLSearchParams({
       url: url,
@@ -473,19 +479,25 @@ async function renderWithScrapingBee(url) {
       render_javascript: 'true',
     });
 
+    console.log(`   Request URL: https://api.scrapingbee.com/api/v1/store/html?url=...`);
+    
     const response = await axios.get(
       `https://api.scrapingbee.com/api/v1/store/html?${params}`,
       { timeout: 30000 }
     );
 
     if (response.data && response.data.trim().length > 500) {
-      console.log(`✅ ScrapingBee rendering successful`);
+      console.log(`✅ ScrapingBee rendering successful (${response.data.length} bytes)`);
       return response.data;
     }
+    console.log(`⚠️ ScrapingBee returned too little data: ${response.data?.length || 0} bytes`);
     return null;
   } catch (error) {
     console.error(`⚠️ ScrapingBee FAILED: ${error.message}`);
-    if (error.response?.status) console.error(`   HTTP ${error.response.status}`);
+    if (error.response?.status) {
+      console.error(`   HTTP ${error.response.status}`);
+      console.error(`   Response:`, error.response?.data?.substring(0, 200));
+    }
     return null;
   }
 }
