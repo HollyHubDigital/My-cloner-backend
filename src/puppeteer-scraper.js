@@ -454,7 +454,8 @@ async function renderWithBrowserless(url) {
     console.log(`✅ Browserless rendering successful`);
     return response.data;
   } catch (error) {
-    console.log(`⚠️ Browserless unavailable: ${error.message}`);
+    console.error(`⚠️ Browserless FAILED: ${error.message}`);
+    if (error.response?.status) console.error(`   HTTP ${error.response.status}`);
     return null;
   }
 }
@@ -481,7 +482,8 @@ async function renderWithScrapingBee(url) {
     }
     return null;
   } catch (error) {
-    console.log(`⚠️ ScrapingBee unavailable: ${error.message}`);
+    console.error(`⚠️ ScrapingBee FAILED: ${error.message}`);
+    if (error.response?.status) console.error(`   HTTP ${error.response.status}`);
     return null;
   }
 }
@@ -526,7 +528,18 @@ export async function scrapeWithPuppeteer(url) {
     }
 
     if (!html) {
-      throw new Error('All rendering methods failed');
+      const errorDetails = `
+        ❌ ALL RENDERING METHODS FAILED
+        Strategy 1 (Local Puppeteer): ${puppeteerModule ? 'Available but failed' : 'Not available'}
+        Strategy 2 (Browserless): Using key '${process.env.BROWSERLESS_API_KEY || 'demo'}'
+        Strategy 3 (ScrapingBee): Using key 'public'
+        
+        SOLUTION: Add API keys to Vercel environment variables:
+        - BROWSERLESS_API_KEY (get free at browserless.io)
+        - SCRAPINGBEE_API_KEY (get free at scrapingbee.com)
+      `;
+      console.error(errorDetails);
+      throw new Error(`All rendering methods failed. ${errorDetails}`);
     }
 
     return {
