@@ -472,26 +472,39 @@ async function renderWithBrowserless(url) {
     const keyDisplay = apiKey === 'demo' ? 'demo (limited)' : apiKey.substring(0, 10) + '...';
     console.log(`   Using key: ${keyDisplay}`);
     
-    const payload = {
-      url: url,
-      rejectResourceTypes: ['image', 'stylesheet', 'font', 'media'],
-      waitFor: 5000,
-      scrollPage: false,
-    };
+    // Browserless content API is strict about accepted payload keys.
+    // Send the minimal payload and allow Browserless defaults to handle waiting/scrolling.
+    const payload = { url };
 
-    console.log(`   Sending request...`);
-    
-    const response = await axios.post(
-      `https://chrome.browserless.io/content?token=${apiKey}`,
-      payload,
-      {
-        timeout: 30000,
-        headers: { 'Content-Type': 'application/json' },
+    console.log(`   Sending request to Browserless...`);
+
+    // Retry a couple times in case of transient failures
+    let attempts = 0;
+    let lastErr = null;
+    while (attempts < 3) {
+      attempts += 1;
+      try {
+        const response = await axios.post(
+          `https://chrome.browserless.io/content?token=${apiKey}`,
+          payload,
+          {
+            timeout: 30000,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+        console.log(`✅ Browserless rendering successful (attempt ${attempts})`);
+        return response.data;
+      } catch (err) {
+        lastErr = err;
+        console.error(`   Browserless attempt ${attempts} failed: ${err.message}`);
+        if (attempts < 3) await new Promise(r => setTimeout(r, 800));
       }
-    );
+    }
 
-    console.log(`✅ Browserless rendering successful`);
-    return response.data;
+    // If we reach here, return structured error info
+    const respData = lastErr?.response?.data;
+    const snippet = typeof respData === 'string' ? respData.substring(0, 1000) : respData ? JSON.stringify(respData).substring(0, 1000) : null;
+    return { error: lastErr?.message || String(lastErr), status: lastErr?.response?.status, responseSnippet: snippet };
   } catch (error) {
     console.error(`⚠️ Browserless FAILED: ${error.message}`);
     if (error.response?.status) {
