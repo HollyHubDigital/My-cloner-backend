@@ -48,7 +48,7 @@ async function renderWithLocalPuppeteer(url) {
     console.log(`🎭 Rendering with local Puppeteer...`);
 
     if (!browser) {
-      browser = await puppeteerModule.launch({
+      const launchArgs = {
         headless: 'new',
         args: [
           '--no-sandbox',
@@ -56,7 +56,42 @@ async function renderWithLocalPuppeteer(url) {
           '--disable-dev-shm-usage',
           '--disable-gpu',
         ],
-      });
+      };
+
+      // If Puppeteer exposes an executablePath helper, try to use it
+      try {
+        if (puppeteerModule && typeof puppeteerModule.executablePath === 'function') {
+          const execPath = puppeteerModule.executablePath();
+          if (execPath) {
+            launchArgs.executablePath = execPath;
+            console.log(`ℹ️ Using puppeteer executablePath: ${execPath}`);
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      try {
+        browser = await puppeteerModule.launch(launchArgs);
+      } catch (launchErr) {
+        console.log('⚠️ Puppeteer launch failed, retrying with extra flags and no-sandbox...');
+        try {
+          browser = await puppeteerModule.launch({
+            headless: true,
+            args: [
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage',
+              '--single-process',
+              '--disable-gpu',
+            ],
+            ignoreDefaultArgs: ['--enable-automation']
+          });
+        } catch (e) {
+          console.log(`⚠️ Final puppeteer launch retry failed: ${e.message}`);
+          throw e;
+        }
+      }
     }
 
     const page = await browser.newPage();
