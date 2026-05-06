@@ -165,8 +165,49 @@ function sanitizeHtmlForCloning(html) {
   return cleaned;
 }
 
+// Remove CSP meta tags and neutralize service-worker registrations in HTML
+function stripCSPAndServiceWorker(html) {
+  if (!html) return html;
+  let out = html;
+
+  // Remove Content-Security-Policy meta tags
+  out = out.replace(/<meta[^>]*http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi, '');
+  out = out.replace(/<meta[^>]*http-equiv=["']?X-Content-Security-Policy["']?[^>]*>/gi, '');
+  out = out.replace(/<meta[^>]*name=["']?content-security-policy["']?[^>]*>/gi, '');
+
+  // Remove CSP meta tags with single quotes or mixed attributes
+  out = out.replace(/<meta[^>]*(?:http-equiv|name)=["']?content-security-policy["']?[^>]*>/gi, '');
+
+  // Neutralize service worker registration by replacing register(...) with a noop
+  out = out.replace(/navigator\.serviceWorker\.register\s*\([^;]*\);?/gi, '/* service worker registration removed */');
+  out = out.replace(/navigator\.serviceWorker\s*\.\s*register\s*\([^;]*\);?/gi, '/* service worker registration removed */');
+
+  // Neutralize self.addEventListener('install'/'activate'...) common patterns
+  out = out.replace(/self\.addEventListener\s*\(\s*['"](?:install|activate|fetch)['"][\s\S]*?\}\s*\)\s*;?/gi, '/* service worker event listener removed */');
+
+  return out;
+}
+
+// Sanitize extracted JS: remove service-worker registration and unsafe CSP script injections
+function sanitizeExtractedJS(js) {
+  if (!js) return js;
+  let out = js;
+
+  // Remove service worker registration calls
+  out = out.replace(/navigator\.serviceWorker\.register\s*\([^\)]*\)\s*;?/gi, '/* service worker registration removed */');
+  out = out.replace(/navigator\.serviceWorker\s*\.\s*register\s*\([^\)]*\)\s*;?/gi, '/* service worker registration removed */');
+
+  // Remove direct calls to self.addEventListener in extracted scripts
+  out = out.replace(/self\.addEventListener\s*\(\s*['"](?:install|activate|fetch)['"][\s\S]*?\}\s*\)\s*;?/gi, '/* service worker handler removed */');
+
+  // Remove importScripts(...) which service workers may use
+  out = out.replace(/importScripts\s*\([^\)]*\)\s*;?/gi, '/* importScripts removed */');
+
+  return out;
+}
+
 // Inline all images and fonts in HTML as base64
-async function inlineAssetsInHtml(html, baseUrl) {
+async function inlineAssetsInHtml(html, baseUrl, capturedAssets = {}) {
   try {
     console.log(`  📦 Inlining images and fonts as base64...`);
     
@@ -175,12 +216,25 @@ async function inlineAssetsInHtml(html, baseUrl) {
     let inlinedHtml = html;
     let imgMatches = [...html.matchAll(imgRegex)];
     
-    for (const match of imgMatches) {
-      const originalUrl = match[2];
-      if (originalUrl.startsWith('data:')) continue; // Skip already inlined
-      
-      const dataUrl = await downloadAndEncodeAsBase64(originalUrl, baseUrl);
-      inlinedHtml = inlinedHtml.replace(match[0], match[1] + dataUrl + match[3]);
+    // Collect unique image URLs
+    const imgUrls = imgMatches.map(m => m[2]).filter(u => u && !u.startsWith('data:'));
+    for (const originalUrl of [...new Set(imgUrls)]) {
+      try {
+        // Prefer captured assets from Puppeteer
+        const resolvedUrl = (originalUrl.startsWith('http') || originalUrl.startsWith('//')) ? originalUrl : new URL(originalUrl, baseUrl).href;
+        const captured = capturedAssets[resolvedUrl] || capturedAssets[originalUrl];
+        let dataUrl = captured;
+        if (!dataUrl) {
+          dataUrl = await downloadAndEncodeAsBase64(originalUrl, baseUrl);
+        }
+        if (dataUrl) {
+          inlinedHtml = inlinedHtml.replace(new RegExp(`<img([^>]*?)src=[\"']${escapeRegExp(originalUrl)}[\"']([^>]*?)>`, 'gi'), (full, p1, p2) => {
+            return `<img${p1}src="${dataUrl}"${p2}>`;
+          });
+        }
+      } catch (e) {
+        // ignore individual failures
+      }
     }
     
     // Process CSS @font-face URLs
@@ -189,10 +243,16 @@ async function inlineAssetsInHtml(html, baseUrl) {
     
     for (const match of fontMatches) {
       const originalUrl = match[1];
-      if (originalUrl.startsWith('data:')) continue; // Skip already inlined
-      
-      const dataUrl = await downloadAndEncodeAsBase64(originalUrl, baseUrl);
-      inlinedHtml = inlinedHtml.replace(match[0], `url('${dataUrl}')`);
+      try {
+        const resolvedUrl = originalUrl.startsWith('http') ? originalUrl : new URL(originalUrl, baseUrl).href;
+        const captured = capturedAssets[resolvedUrl] || capturedAssets[originalUrl];
+        const dataUrl = captured || await downloadAndEncodeAsBase64(originalUrl, baseUrl);
+        if (dataUrl) {
+          inlinedHtml = inlinedHtml.replace(match[0], `url('${dataUrl}')`);
+        }
+      } catch (e) {
+        // ignore
+      }
     }
     
     // Process background-image URLs in style attributes
@@ -201,10 +261,15 @@ async function inlineAssetsInHtml(html, baseUrl) {
     
     for (const match of bgMatches) {
       const originalUrl = match[1];
-      if (originalUrl.startsWith('data:') || originalUrl.startsWith('https')) continue; // Skip already inlined or absolute URLs
-      
-      const dataUrl = await downloadAndEncodeAsBase64(originalUrl, baseUrl);
-      inlinedHtml = inlinedHtml.replace(match[0], `background-image: url('${dataUrl}')`);
+      try {
+        if (originalUrl.startsWith('data:')) continue;
+        const resolvedUrl = originalUrl.startsWith('http') ? originalUrl : new URL(originalUrl, baseUrl).href;
+        const captured = capturedAssets[resolvedUrl] || capturedAssets[originalUrl];
+        const dataUrl = captured || await downloadAndEncodeAsBase64(originalUrl, baseUrl);
+        if (dataUrl) inlinedHtml = inlinedHtml.replace(match[0], `background-image: url('${dataUrl}')`);
+      } catch (e) {
+        // ignore
+      }
     }
     
     console.log(`  ✅ Asset inlining complete`);
@@ -213,6 +278,11 @@ async function inlineAssetsInHtml(html, baseUrl) {
     console.log(`  ⚠️ Asset inlining error: ${error.message}`);
     return html; // Return original if inlining fails
   }
+}
+
+// Utility: escape RegExp special chars for building dynamic regex
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // Fetch external CSS file (simple GET wrapper)
@@ -1096,11 +1166,17 @@ async function extractWebsiteFiles(url, pureHtml = false) {
       usePuppeteer = true;
     }
 
+    let capturedAssets = {};
     if (usePuppeteer) {
       console.log(`🤖 Using Puppeteer for JavaScript rendering...`);
       const result = await scrapeWithPuppeteer(url);
-      html = result.html;
-      title = result.title;
+      if (result && typeof result === 'object') {
+        html = result.html || '';
+        title = result.title;
+        capturedAssets = result.assets || {};
+      } else {
+        html = result;
+      }
     } else {
       const $ = load(html);
       title = $('title').text() || 'Cloned Website';
@@ -1134,6 +1210,9 @@ async function extractWebsiteFiles(url, pureHtml = false) {
       // Sanitize HTML to remove problematic [object Object] patterns
       console.log(`🧹 Sanitizing HTML for problematic patterns...`);
       cleanHTML = sanitizeHtmlForCloning(cleanHTML);
+
+      // Strip Content-Security-Policy meta tags and neutralize service-worker registrations
+      cleanHTML = stripCSPAndServiceWorker(cleanHTML);
       
       // Remove React error boundary messages and 404 text
       console.log(`🧹 Removing error messages...`);
@@ -1155,7 +1234,7 @@ async function extractWebsiteFiles(url, pureHtml = false) {
       // INLINE all images and fonts as base64 for iframe compatibility
       console.log(`📦 Starting asset inlining...`);
       if (cleanHTML.length < 10000000) { // Only inline if not too large
-        cleanHTML = await inlineAssetsInHtml(cleanHTML, baseUrl);
+        cleanHTML = await inlineAssetsInHtml(cleanHTML, baseUrl, capturedAssets);
       } else {
         console.log(`⚠️ HTML too large for asset inlining, skipping...`);
       }
@@ -1525,7 +1604,9 @@ window.addEventListener('error', (e) => {
       
       // Extract JavaScript from HTML BEFORE removing script tags
       console.log(`⚙️ Extracting JavaScript from Puppeteer-rendered HTML...`);
-      const extractedJS = await extractScriptsFromHTML(cleanHTML, baseUrl);
+      let extractedJS = await extractScriptsFromHTML(cleanHTML, baseUrl);
+      // Sanitize extracted JS (remove service worker registrations, importScripts, etc.)
+      extractedJS = sanitizeExtractedJS(extractedJS);
       
       // Extract CSS from all <style> tags in the rendered HTML
       console.log(`🎨 Extracting CSS from Puppeteer-rendered HTML...`);
@@ -1567,7 +1648,67 @@ window.addEventListener('error', (e) => {
     const css = await extractAllCSS($, baseUrl);
 
     console.log(`⚙️ Extracting JavaScript...`);
-    const js = await extractAllJS($, baseUrl);
+    let js = await extractAllJS($, baseUrl);
+    // Sanitize extracted JS for service worker registrations and imports
+    js = sanitizeExtractedJS(js);
+
+    // If we found no CSS but there are scripts, it's likely styles are injected at runtime.
+    // In that case, fall back to Puppeteer to capture rendered styles and assets.
+    const inlineCssEmpty = !css || css.trim().length < 100;
+    const scriptCount = ($('script').length || 0);
+    const looksLikeRootApp = /<div[^>]*(id|class)=["'](?:root|app|__next|gatsby-root)["']/i.test(html) || (html && html.length < 5000);
+    if (inlineCssEmpty) {
+      console.log('⚠️ No CSS discovered via static fetch but scripts present — falling back to Puppeteer for runtime rendering');
+      const result = await scrapeWithPuppeteer(url);
+      if (result && typeof result === 'object') {
+        let cleanHTML = result.html || '';
+        const captured = result.assets || {};
+        title = result.title || title;
+
+        // Post-process similarly to the Puppeteer branch
+        cleanHTML = convertRelativeUrlsInAttributes(cleanHTML, baseUrl);
+        cleanHTML = rewriteMediaUrls(cleanHTML, baseUrl);
+        cleanHTML = sanitizeHtmlForCloning(cleanHTML);
+        cleanHTML = stripCSPAndServiceWorker(cleanHTML);
+
+        // Remove common error messages
+        cleanHTML = cleanHTML.replace(/Unexpected Application Error/gi, '');
+        cleanHTML = cleanHTML.replace(/404 Not Found/gi, '');
+        cleanHTML = cleanHTML.replace(/You can provide a way better UX/gi, '');
+        cleanHTML = cleanHTML.replace(/Hey developer/gi, '');
+        cleanHTML = cleanHTML.replace(/ErrorBoundary/gi, '');
+
+        // Inline assets using captured map
+        if (cleanHTML.length < 10000000) {
+          cleanHTML = await inlineAssetsInHtml(cleanHTML, baseUrl, captured);
+        }
+
+        // Extract JS and CSS from the rendered HTML
+        const extractedJS = await extractScriptsFromHTML(cleanHTML, baseUrl);
+        const cssArray = [];
+        const styleRegex = /<style[^>]*>([\s\S]*?)<\/style>/gi;
+        let styleMatch;
+        while ((styleMatch = styleRegex.exec(cleanHTML)) !== null) {
+          const c = styleMatch[1];
+          if (c && c.trim().length > 0) cssArray.push(c);
+        }
+        const extractedCSS = cssArray.length > 0 ? cssArray.join('\n\n/* ===== STYLE SEPARATOR ===== */\n\n') : '';
+
+        // Remove script/style tags from HTML for returned clean HTML
+        let htmlWithoutScriptsAndStyles = removeScriptTagsFromHTML(cleanHTML);
+        htmlWithoutScriptsAndStyles = removeStyleTagsFromHTML(htmlWithoutScriptsAndStyles);
+
+        return {
+          success: true,
+          html: htmlWithoutScriptsAndStyles,
+          css: extractedCSS,
+          js: sanitizeExtractedJS(extractedJS),
+          assets: [],
+          title: title,
+          method: 'puppeteer-static'
+        };
+      }
+    }
 
     console.log(`🖼️ Extracting assets (images, videos, fonts)...`);
     const assets = await extractAllAssets($, baseUrl);

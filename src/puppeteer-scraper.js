@@ -101,6 +101,54 @@ async function renderWithLocalPuppeteer(url) {
     
     await page.setViewport({ width: 1920, height: 1080 });
 
+    // Capture network responses (images, fonts, stylesheets, scripts, XHR) for inlining later
+    const captured = new Map();
+    page.on('response', async (response) => {
+      try {
+        const status = response.status();
+        if (status < 200 || status >= 300) return;
+
+        const urlResp = response.url();
+        // Prefer header-driven detection in case resourceType is misleading
+        const headers = (response.headers && typeof response.headers === 'function') ? response.headers() : (response.headers ? response.headers : {});
+        const contentType = headers['content-type'] || headers['Content-Type'] || '';
+
+        // Only capture likely useful asset types
+        const shouldCaptureByType = /(^|\b)(image\/|text\/css|font\/|application\/(?:javascript|x-javascript)|text\/javascript|application\/svg\+xml|application\/octet-stream)/i.test(contentType);
+
+        // Also allow capture for known resource types
+        const req = response.request();
+        const rtype = req && typeof req.resourceType === 'function' ? req.resourceType() : (req && req.resourceType) || '';
+        const shouldCaptureByResource = ['image', 'font', 'stylesheet', 'script', 'xhr', 'fetch', 'document'].includes(rtype);
+
+        if (!shouldCaptureByType && !shouldCaptureByResource) return;
+
+        // Avoid extremely large assets
+        const buffer = await response.buffer();
+        if (!buffer || buffer.length === 0) return;
+        const MAX_CAPTURE_BYTES = 1024 * 1024 * 3; // 3MB
+        if (buffer.length > MAX_CAPTURE_BYTES) return; // skip huge assets
+
+        const base64 = buffer.toString('base64');
+        const mime = contentType ? contentType.split(';')[0].trim() : '';
+        const dataUrl = mime ? `data:${mime};base64,${base64}` : `data:application/octet-stream;base64,${base64}`;
+
+        // Normalize keys: full URL, protocol-less, and without query string
+        try {
+          const u = new URL(urlResp);
+          const withoutQuery = u.origin + u.pathname;
+          captured.set(urlResp, dataUrl);
+          captured.set(withoutQuery, dataUrl);
+          captured.set(urlResp.replace(/^https?:/, ''), dataUrl);
+        } catch (e) {
+          // fallback: store raw
+          captured.set(urlResp, dataUrl);
+        }
+      } catch (e) {
+        // ignore per-response failures
+      }
+    });
+
     console.log(`⏳ Navigating to ${url}...`);
     await page.goto(url, {
       waitUntil: 'networkidle2',
@@ -213,9 +261,9 @@ async function renderWithLocalPuppeteer(url) {
     
     await new Promise(resolve => setTimeout(resolve, 2000));
 
-    // Get the fully rendered HTML with all stylesheets inlined
+    // Get the fully rendered HTML with all stylesheets inlined and shadow DOM serialized
     console.log(`📄 Extracting fully rendered HTML with stylesheet inlining...`);
-    
+
     // Inject CSS inlining logic - extract stylesheets that are already loaded
     const htmlWithInlinedStyles = await page.evaluate(() => {
       let allCssContent = '';
@@ -277,20 +325,103 @@ async function renderWithLocalPuppeteer(url) {
         }
       }
       
+      // Serialize Shadow DOM content by appending a hidden container with the shadowHTML
+      try {
+        const hosts = [];
+        const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ELEMENT);
+        let node = walker.currentNode;
+        while (node) {
+          try {
+            if (node.shadowRoot) {
+              // Append a hidden container so serialization includes shadow DOM content
+              const container = document.createElement('div');
+              container.setAttribute('data-cloned-shadowroot-for', node.tagName.toLowerCase());
+              container.style.display = 'none';
+              container.innerHTML = node.shadowRoot.innerHTML || '';
+              node.appendChild(container);
+            }
+          } catch (e) {
+            // ignore
+          }
+          node = walker.nextNode();
+        }
+      } catch (e) {
+        // ignore
+      }
+
       // Return the complete HTML
       return document.documentElement.outerHTML;
     });
+
+    // Extract captured assets into a plain object
+    const assetsObj = {};
+    for (const [k, v] of captured.entries()) assetsObj[k] = v;
+
+    // Attempt to inline external SVG sprite files referenced via <use> by injecting their markup
+    try {
+      // Find external <use> references like <use xlink:href="/icons.svg#icon"> in the HTML
+      const useHrefRegex = /<use[^>]+(?:xlink:href|href)=["']([^"']+)["'][^>]*>/gi;
+      const spriteBases = new Set();
+      let m;
+      while ((m = useHrefRegex.exec(htmlWithInlinedStyles)) !== null) {
+        const ref = m[1];
+        if (!ref) continue;
+        const hashIdx = ref.indexOf('#');
+        if (hashIdx > 0) {
+          const base = ref.substring(0, hashIdx);
+          // resolve relative URLs by using the page URL
+          try {
+            const resolved = new URL(base, url).href;
+            spriteBases.add(resolved);
+          } catch (e) {
+            spriteBases.add(base);
+          }
+        }
+      }
+
+      if (spriteBases.size > 0) {
+        let injectedSprites = '';
+        for (const base of spriteBases) {
+          const dataUrl = assetsObj[base] || assetsObj[base.replace(/^https?:/, '')];
+          if (!dataUrl) continue;
+          // Only handle SVG content
+          if (/^data:(?:image|text)\/svg\+xml;base64,/.test(dataUrl)) {
+            const b64 = dataUrl.split(',')[1];
+            try {
+              const svgText = Buffer.from(b64, 'base64').toString('utf8');
+              injectedSprites += '\n' + svgText + '\n';
+            } catch (e) {
+              // ignore decode errors
+            }
+          }
+        }
+
+        if (injectedSprites) {
+          // Inject the collected sprites into a hidden container at the start of <body>
+          const headIdx = htmlWithInlinedStyles.indexOf('<body');
+          const insertPos = headIdx >= 0 ? htmlWithInlinedStyles.indexOf('>', headIdx) + 1 : htmlWithInlinedStyles.indexOf('>') + 1;
+          if (insertPos > 0) {
+            const spriteContainer = `<div id="__inlined_svg_sprites" style="display:none">${injectedSprites}</div>`;
+            htmlWithInlinedStyles = htmlWithInlinedStyles.slice(0, insertPos) + spriteContainer + htmlWithInlinedStyles.slice(insertPos);
+          } else {
+            htmlWithInlinedStyles = `<div id="__inlined_svg_sprites" style="display:none">${injectedSprites}</div>` + htmlWithInlinedStyles;
+          }
+        }
+      }
+    } catch (e) {
+      // ignore sprite injection errors
+    }
 
     await page.close();
 
     // Ensure DOCTYPE is included
     const doctype = '<!DOCTYPE html>';
-    const finalHtml = htmlWithInlinedStyles.toLowerCase().startsWith('<!doctype') 
-      ? htmlWithInlinedStyles 
+    const finalHtml = htmlWithInlinedStyles.toLowerCase().startsWith('<!doctype')
+      ? htmlWithInlinedStyles
       : doctype + htmlWithInlinedStyles;
 
-    console.log(`✅ Puppeteer rendering complete with inlined styles`);
-    return finalHtml;
+    console.log(`✅ Puppeteer rendering complete with inlined styles (captured ${Object.keys(assetsObj).length} assets)`);
+    return { html: finalHtml, assets: assetsObj };
   } catch (error) {
     console.log(`⚠️ Puppeteer failed: ${error.message}`);
     return null;
@@ -366,11 +497,20 @@ export async function scrapeWithPuppeteer(url) {
   try {
     let html = null;
     let method = 'unknown';
+    let assets = {};
 
     // Strategy 1: Try local Puppeteer
     if (puppeteerModule) {
-      html = await renderWithLocalPuppeteer(url);
-      if (html) method = 'local-puppeteer';
+      const result = await renderWithLocalPuppeteer(url);
+      if (result) {
+        if (typeof result === 'object' && result.html) {
+          html = result.html;
+          assets = result.assets || {};
+        } else {
+          html = result;
+        }
+        method = 'local-puppeteer';
+      }
     }
 
     // Strategy 2: Try Browserless cloud
@@ -391,7 +531,8 @@ export async function scrapeWithPuppeteer(url) {
 
     return {
       html,
-      title: extractTitle(html),
+      assets,
+      title: extractTitle(typeof html === 'string' ? html : (html.html || '')),
       method,
     };
   } catch (error) {
