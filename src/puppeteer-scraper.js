@@ -424,7 +424,7 @@ async function renderWithLocalPuppeteer(url) {
     return { html: finalHtml, assets: assetsObj };
   } catch (error) {
     console.log(`⚠️ Puppeteer failed: ${error.message}`);
-    return null;
+    return { error: error.message || String(error) };
   }
 }
 
@@ -470,7 +470,9 @@ async function renderWithBrowserless(url) {
     } else {
       console.error(`   Error details:`, error.code, error.errno);
     }
-    return null;
+    const respData = error.response?.data;
+    const snippet = typeof respData === 'string' ? respData.substring(0, 1000) : respData ? JSON.stringify(respData).substring(0, 1000) : null;
+    return { error: error.message || String(error), status: error.response?.status, responseSnippet: snippet };
   }
 }
 
@@ -514,7 +516,9 @@ async function renderWithScrapingBee(url) {
     } else {
       console.error(`   Error details:`, error.code, error.errno);
     }
-    return null;
+    const respData = error.response?.data;
+    const snippet = typeof respData === 'string' ? respData.substring(0, 1000) : respData ? JSON.stringify(respData).substring(0, 1000) : null;
+    return { error: error.message || String(error), status: error.response?.status, responseSnippet: snippet };
   }
 }
 
@@ -531,6 +535,11 @@ export async function scrapeWithPuppeteer(url) {
     let method = 'unknown';
     let assets = {};
 
+    // Collect per-strategy error details for debugging
+    let localError = null;
+    let browserlessError = null;
+    let scrapingBeeError = null;
+
     // Strategy 1: Try local Puppeteer
     if (puppeteerModule) {
       const result = await renderWithLocalPuppeteer(url);
@@ -538,39 +547,68 @@ export async function scrapeWithPuppeteer(url) {
         if (typeof result === 'object' && result.html) {
           html = result.html;
           assets = result.assets || {};
-        } else {
+          method = 'local-puppeteer';
+        } else if (typeof result === 'object' && result.error) {
+          localError = result.error;
+        } else if (typeof result === 'string') {
           html = result;
+          method = 'local-puppeteer';
         }
-        method = 'local-puppeteer';
       }
     }
 
     // Strategy 2: Try Browserless cloud
     if (!html) {
-      html = await renderWithBrowserless(url);
-      if (html) method = 'browserless';
+      const bres = await renderWithBrowserless(url);
+      if (bres) {
+        if (typeof bres === 'object' && bres.html) {
+          html = bres.html;
+          method = 'browserless';
+        } else if (typeof bres === 'string') {
+          html = bres;
+          method = 'browserless';
+        } else if (typeof bres === 'object' && bres.error) {
+          browserlessError = `${bres.error}` + (bres.status ? ` (HTTP ${bres.status})` : '');
+          if (bres.responseSnippet) browserlessError += ` -- ${bres.responseSnippet.substring(0,300)}`;
+        }
+      }
     }
 
     // Strategy 3: Try ScrapingBee
     if (!html) {
-      html = await renderWithScrapingBee(url);
-      if (html) method = 'scrapingbee';
+      const sres = await renderWithScrapingBee(url);
+      if (sres) {
+        if (typeof sres === 'object' && sres.html) {
+          html = sres.html;
+          method = 'scrapingbee';
+        } else if (typeof sres === 'string') {
+          html = sres;
+          method = 'scrapingbee';
+        } else if (typeof sres === 'object' && sres.error) {
+          scrapingBeeError = `${sres.error}` + (sres.status ? ` (HTTP ${sres.status})` : '');
+          if (sres.responseSnippet) scrapingBeeError += ` -- ${sres.responseSnippet.substring(0,300)}`;
+        }
+      }
     }
 
     if (!html) {
       const browserlessKey = process.env.BROWSERLESS_API_KEY || 'demo';
       const scrapingbeeKey = process.env.SCRAPINGBEE_API_KEY || 'public';
       
-      const errorDetails = `
-        ❌ ALL RENDERING METHODS FAILED
-        Strategy 1 (Local Puppeteer): ${puppeteerModule ? 'Available but failed' : 'Not available'}
-        Strategy 2 (Browserless): Using key '${browserlessKey}'
-        Strategy 3 (ScrapingBee): Using key '${scrapingbeeKey}'
-        
-        SOLUTION: Add API keys to Vercel environment variables:
-        - BROWSERLESS_API_KEY (get free at browserless.io)
-        - SCRAPINGBEE_API_KEY (get free at scrapingbee.com)
-      `;
+      const errorDetails = [
+        '❌ ALL RENDERING METHODS FAILED',
+        `Strategy 1 (Local Puppeteer): ${puppeteerModule ? 'Available but failed' : 'Not available'}`,
+        localError ? `  - Local error: ${localError.substring(0,400)}` : null,
+        `Strategy 2 (Browserless): Using key '${browserlessKey}'`,
+        browserlessError ? `  - Browserless error: ${browserlessError.substring(0,400)}` : null,
+        `Strategy 3 (ScrapingBee): Using key '${scrapingbeeKey}'`,
+        scrapingBeeError ? `  - ScrapingBee error: ${scrapingBeeError.substring(0,400)}` : null,
+        '',
+        'SOLUTION: Add API keys to Vercel environment variables:',
+        '- BROWSERLESS_API_KEY (get free at browserless.io)',
+        '- SCRAPINGBEE_API_KEY (get free at scrapingbee.com)'
+      ].filter(Boolean).join('\n');
+
       console.error(errorDetails);
       throw new Error(`All rendering methods failed. ${errorDetails}`);
     }
